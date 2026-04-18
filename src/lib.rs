@@ -49,6 +49,17 @@ const SPL_MEMO_V1: &str = "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo";
 /// SPL Token `TransferChecked` instruction discriminator
 const TRANSFER_CHECKED: u8 = 12;
 
+/// ComputeBudget program
+const COMPUTE_BUDGET: &str = "ComputeBudget111111111111111111111111111111";
+
+/// Lighthouse program (wallet-injected guards)
+const LIGHTHOUSE: &str = "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95";
+
+/// ComputeBudget SetComputeUnitLimit discriminator
+const CB_SET_LIMIT: u8 = 2;
+/// ComputeBudget SetComputeUnitPrice discriminator
+const CB_SET_PRICE: u8 = 3;
+
 /// Convert Unix timestamp seconds to PostgreSQL TIMESTAMP format
 fn unix_to_timestamp(secs: i64) -> String {
     let days_since_epoch = secs / 86400;
@@ -127,7 +138,6 @@ fn decode_transfer_checked(data: &[u8]) -> Option<(u64, u8)> {
 struct TransferCheckedCall<'a> {
     instruction_index: u32,
     token_program: &'a str,
-    source_idx: u8,
     mint_idx: u8,
     destination_idx: u8,
     authority_idx: u8,
@@ -156,7 +166,6 @@ fn try_transfer_checked<'a>(
     Some(TransferCheckedCall {
         instruction_index: ix_index,
         token_program,
-        source_idx: accounts[0],
         mint_idx: accounts[1],
         destination_idx: accounts[2],
         authority_idx: accounts[3],
@@ -165,16 +174,59 @@ fn try_transfer_checked<'a>(
     })
 }
 
-/// Returns true if the program_id is an SPL Memo program (v1 or v2).
-fn is_memo_program(program_id: &str) -> bool {
-    program_id == SPL_MEMO_V2 || program_id == SPL_MEMO_V1
-}
-
 // =============================================
 // LAYER 1: Settlement Extraction
 // =============================================
 
+/// Classification of a top-level instruction in a candidate x402 tx.
+enum TopIx<'a> {
+    ComputeBudgetSetLimit,
+    ComputeBudgetSetPrice,
+    TransferChecked(TransferCheckedCall<'a>),
+    Memo(Vec<u8>),
+    Lighthouse,
+    Other,
+}
+
+fn classify_top_instruction<'a>(
+    ix: &sol::CompiledInstruction,
+    program_id: &str,
+    ix_index: u32,
+) -> TopIx<'a> {
+    match program_id {
+        COMPUTE_BUDGET => match ix.data.first() {
+            Some(&CB_SET_LIMIT) => TopIx::ComputeBudgetSetLimit,
+            Some(&CB_SET_PRICE) => TopIx::ComputeBudgetSetPrice,
+            _ => TopIx::Other,
+        },
+        SPL_TOKEN_PROGRAM | TOKEN_2022_PROGRAM => {
+            match try_transfer_checked(
+                &ix.accounts,
+                &ix.data,
+                ix_index,
+                program_id_to_static(program_id),
+            ) {
+                Some(tc) => TopIx::TransferChecked(tc),
+                None => TopIx::Other,
+            }
+        }
+        SPL_MEMO_V1 | SPL_MEMO_V2 => TopIx::Memo(ix.data.clone()),
+        LIGHTHOUSE => TopIx::Lighthouse,
+        _ => TopIx::Other,
+    }
+}
+
 /// Extract x402 payment settlements from Solana blocks.
+///
+/// Strict detection per the x402 SVM `exact` scheme. A valid settlement has:
+///   - 3 to 6 top-level instructions
+///   - ixs[0]: ComputeBudget SetComputeUnitLimit
+///   - ixs[1]: ComputeBudget SetComputeUnitPrice
+///   - ixs[2]: SPL Token / Token-2022 TransferChecked
+///   - ixs[3..=5]: any of { SPL Memo, Lighthouse }
+///   - At least one SPL Memo instruction present
+///   - Transaction fee payer != TransferChecked authority
+///   - Fee payer not referenced in any instruction's accounts
 #[substreams::handlers::map]
 fn map_x402_settlements(
     blk: sol::Block,
@@ -208,127 +260,134 @@ fn map_x402_settlements(
             continue;
         }
 
-        let keys = resolved_keys(msg, meta);
-
-        // Fee payer is always the first signer (first account key).
-        let fee_payer = b58(&keys[0]);
-        let signature = b58(&tx.signatures[0]);
-        let fee_lamports = meta.fee;
-
-        // Walk all instructions (top-level + inner) and classify them.
-        // We use compiled instructions directly so we have account indexes
-        // for post_token_balances lookup.
-        let mut transfer_checked_calls: Vec<TransferCheckedCall> = Vec::new();
-        let mut memo_datas: Vec<Vec<u8>> = Vec::new();
-        let mut running_ix_index: u32 = 0;
-
-        for (top_idx, ix) in msg.instructions.iter().enumerate() {
-            let prog_idx = ix.program_id_index as usize;
-            if prog_idx >= keys.len() {
-                continue;
-            }
-            let program_id = b58(&keys[prog_idx]);
-
-            if let Some(tc) = try_transfer_checked(
-                &ix.accounts,
-                &ix.data,
-                running_ix_index,
-                program_id_to_static(&program_id),
-            ) {
-                transfer_checked_calls.push(tc);
-            } else if is_memo_program(&program_id) {
-                memo_datas.push(ix.data.clone());
-            }
-            running_ix_index += 1;
-
-            // Inner instructions associated with this top-level index
-            for inner_set in meta.inner_instructions.iter() {
-                if inner_set.index as usize != top_idx {
-                    continue;
-                }
-                for inner_ix in &inner_set.instructions {
-                    let inner_prog_idx = inner_ix.program_id_index as usize;
-                    if inner_prog_idx >= keys.len() {
-                        continue;
-                    }
-                    let inner_program_id = b58(&keys[inner_prog_idx]);
-                    if let Some(tc) = try_transfer_checked(
-                        &inner_ix.accounts,
-                        &inner_ix.data,
-                        running_ix_index,
-                        program_id_to_static(&inner_program_id),
-                    ) {
-                        transfer_checked_calls.push(tc);
-                    } else if is_memo_program(&inner_program_id) {
-                        memo_datas.push(inner_ix.data.clone());
-                    }
-                    running_ix_index += 1;
-                }
-            }
-        }
-
-        // x402 settlement must have at least one TransferChecked + one Memo
-        if transfer_checked_calls.is_empty() || memo_datas.is_empty() {
+        // Spec: 3 to 6 top-level instructions.
+        let top_ixs = &msg.instructions;
+        if top_ixs.len() < 3 || top_ixs.len() > 6 {
             continue;
         }
 
-        let memo = memo_datas
-            .first()
-            .map(|d| String::from_utf8_lossy(d).to_string())
+        let keys = resolved_keys(msg, meta);
+        let fee_payer_bytes = &keys[0];
+        let fee_payer = b58(fee_payer_bytes);
+        let signature = b58(&tx.signatures[0]);
+        let fee_lamports = meta.fee;
+
+        // Classify each top-level instruction
+        let mut classified: Vec<TopIx> = Vec::with_capacity(top_ixs.len());
+        for (i, ix) in top_ixs.iter().enumerate() {
+            let prog_idx = ix.program_id_index as usize;
+            if prog_idx >= keys.len() {
+                classified.push(TopIx::Other);
+                continue;
+            }
+            let program_id = b58(&keys[prog_idx]);
+            classified.push(classify_top_instruction(ix, &program_id, i as u32));
+        }
+
+        // Require the exact positional layout
+        if !matches!(classified.first(), Some(TopIx::ComputeBudgetSetLimit)) {
+            continue;
+        }
+        if !matches!(classified.get(1), Some(TopIx::ComputeBudgetSetPrice)) {
+            continue;
+        }
+
+        // Extract the TransferChecked at index 2
+        let tc = match classified.get(2) {
+            Some(TopIx::TransferChecked(tc)) => tc,
+            _ => continue,
+        };
+
+        // Indices 3..end must be Memo or Lighthouse only, and at least one Memo must exist.
+        let mut memo_data: Option<Vec<u8>> = None;
+        let mut trailing_ok = true;
+        for extra in classified.iter().skip(3) {
+            match extra {
+                TopIx::Memo(data) => {
+                    if memo_data.is_none() {
+                        memo_data = Some(data.clone());
+                    }
+                }
+                TopIx::Lighthouse => {}
+                _ => {
+                    trailing_ok = false;
+                    break;
+                }
+            }
+        }
+        if !trailing_ok || memo_data.is_none() {
+            continue;
+        }
+
+        // Fee-payer safety: fee payer MUST NOT be authority of TransferChecked
+        if (tc.authority_idx as usize) >= keys.len() {
+            continue;
+        }
+        let authority_bytes = &keys[tc.authority_idx as usize];
+        if authority_bytes == fee_payer_bytes {
+            continue;
+        }
+
+        // Fee-payer safety: fee payer MUST NOT appear in any instruction's accounts
+        let mut fee_payer_referenced = false;
+        'outer: for ix in top_ixs {
+            for &idx in &ix.accounts {
+                if (idx as usize) < keys.len() && &keys[idx as usize] == fee_payer_bytes {
+                    fee_payer_referenced = true;
+                    break 'outer;
+                }
+            }
+        }
+        if fee_payer_referenced {
+            continue;
+        }
+
+        if (tc.destination_idx as usize) >= keys.len()
+            || (tc.mint_idx as usize) >= keys.len()
+        {
+            continue;
+        }
+
+        let payer = b58(authority_bytes);
+        let destination_ata = b58(&keys[tc.destination_idx as usize]);
+        let mint_from_instr = b58(&keys[tc.mint_idx as usize]);
+
+        let recipient = meta
+            .post_token_balances
+            .iter()
+            .find(|b| b.account_index == tc.destination_idx as u32)
+            .map(|b| b.owner.clone())
             .unwrap_or_default();
 
-        for tc in transfer_checked_calls {
-            if (tc.authority_idx as usize) >= keys.len()
-                || (tc.destination_idx as usize) >= keys.len()
-                || (tc.mint_idx as usize) >= keys.len()
-            {
-                continue;
-            }
+        let mint = meta
+            .post_token_balances
+            .iter()
+            .find(|b| b.account_index == tc.destination_idx as u32)
+            .map(|b| b.mint.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(mint_from_instr);
 
-            let payer = b58(&keys[tc.authority_idx as usize]);
-            // Facilitator-sponsored heuristic: fee payer must differ from authority
-            if payer == fee_payer {
-                continue;
-            }
+        let memo = memo_data
+            .map(|d| String::from_utf8_lossy(&d).to_string())
+            .unwrap_or_default();
 
-            let destination_ata = b58(&keys[tc.destination_idx as usize]);
-            let mint_from_instr = b58(&keys[tc.mint_idx as usize]);
-
-            // Resolve recipient = owner of destination ATA via post_token_balances
-            let recipient = meta
-                .post_token_balances
-                .iter()
-                .find(|b| b.account_index == tc.destination_idx as u32)
-                .map(|b| b.owner.clone())
-                .unwrap_or_default();
-
-            // Prefer mint from post_token_balances when present (authoritative)
-            let mint = meta
-                .post_token_balances
-                .iter()
-                .find(|b| b.account_index == tc.destination_idx as u32)
-                .map(|b| b.mint.clone())
-                .filter(|s| !s.is_empty())
-                .unwrap_or(mint_from_instr);
-
-            out.settlements.push(x402::Settlement {
-                id: format!("{}-{}", signature, tc.instruction_index),
-                signature: signature.clone(),
-                instruction_index: tc.instruction_index,
-                slot,
-                timestamp: block_timestamp.clone(),
-                payer,
-                recipient,
-                destination_ata,
-                mint,
-                amount: tc.amount.to_string(),
-                decimals: tc.decimals as u32,
-                token_program: tc.token_program.to_string(),
-                facilitator: fee_payer.clone(),
-                fee_lamports: fee_lamports.to_string(),
-                memo: memo.clone(),
-            });
-        }
+        out.settlements.push(x402::Settlement {
+            id: format!("{}-{}", signature, tc.instruction_index),
+            signature: signature.clone(),
+            instruction_index: tc.instruction_index,
+            slot,
+            timestamp: block_timestamp.clone(),
+            payer,
+            recipient,
+            destination_ata,
+            mint,
+            amount: tc.amount.to_string(),
+            decimals: tc.decimals as u32,
+            token_program: tc.token_program.to_string(),
+            facilitator: fee_payer.clone(),
+            fee_lamports: fee_lamports.to_string(),
+            memo,
+        });
     }
 
     Ok(out)
