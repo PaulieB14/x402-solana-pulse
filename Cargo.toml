@@ -1,0 +1,33 @@
+[package]
+name = "x402_solana_pulse"
+version = "1.0.0"
+edition = "2021"
+description = "x402 Solana Pulse - Real-time x402 payment protocol analytics on Solana"
+repository = "https://github.com/PaulieB14/x402-solana-pulse"
+
+[lib]
+name = "substreams"
+crate-type = ["cdylib"]
+
+[dependencies]
+substreams = "0.6"
+substreams-solana = "0.14"
+substreams-database-change = "2.1"
+
+prost = "0.13"
+prost-types = "0.13"
+bs58 = "0.5"
+num-bigint = "0.4"
+num-traits = "0.2"
+
+[target.wasm32-unknown-unknown.dependencies]
+getrandom = { version = "0.2", features = ["custom"] }
+
+[build-dependencies]
+prost-build = "0.13"
+anyhow = "1"
+
+[profile.release]
+lto = true
+opt-level = 's'
+strip = "debuginfo"

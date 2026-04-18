@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package x402.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// =============================================
+// LAYER 1: Settlement Extraction
+// =============================================
+
+// All x402 settlements detected in a block
+message Settlements {
+    repeated Settlement settlements = 1;
+    uint64 slot = 2;
+    google.protobuf.Timestamp block_timestamp = 3;
+}
+
+// A single x402 payment settlement on Solana
+//
+// Detected via the SVM `exact` scheme (specs/schemes/exact/scheme_exact_svm.md):
+// 1. Facilitator sponsors a transaction with a partially-signed payload from the client
+// 2. Transaction contains ComputeBudget + SPL Token(-2022) TransferChecked + SPL Memo
+// 3. Fee payer (facilitator) is distinct from the TransferChecked authority (payer)
+message Settlement {
+    string id = 1;                        // {signature}-{instruction_index}
+    string signature = 2;                 // Base58 transaction signature
+    uint32 instruction_index = 3;         // Index of the TransferChecked within tx
+    uint64 slot = 4;
+    google.protobuf.Timestamp timestamp = 5;
+
+    // Payment details
+    string payer = 6;                     // Who paid (TransferChecked authority, base58)
+    string recipient = 7;                 // Resource server wallet (owner of destination ATA)
+    string destination_ata = 8;           // Destination associated token account
+    string mint = 9;                      // SPL token mint (e.g. USDC on Solana)
+    string amount = 10;                   // Payment amount in atomic units
+    uint32 decimals = 11;                 // Token decimals (from TransferChecked data)
+
+    // Token program identification
+    string token_program = 12;            // spl-token or token-2022
+
+    // Facilitator (fee payer)
+    string facilitator = 13;              // Transaction fee payer, base58
+    string fee_lamports = 14;             // Transaction fee in lamports
+
+    // Payment reference
+    string memo = 15;                     // Memo instruction data (UTF-8)
+}
+
+// =============================================
+// LAYER 3: Analytics
+// =============================================
+
+message PayerStats {
+    repeated PayerStat stats = 1;
+    uint64 slot = 2;
+}
+
+message PayerStat {
+    string payer_address = 1;
+    string total_spent = 2;
+    uint64 total_payments = 3;
+    google.protobuf.Timestamp first_payment_at = 4;
+    google.protobuf.Timestamp last_payment_at = 5;
+}
+
+message RecipientStats {
+    repeated RecipientStat stats = 1;
+    uint64 slot = 2;
+}
+
+message RecipientStat {
+    string recipient_address = 1;
+    string total_received = 2;
+    uint64 total_payments = 3;
+    google.protobuf.Timestamp first_payment_at = 4;
+    google.protobuf.Timestamp last_payment_at = 5;
+}
+
+message FacilitatorStats {
+    repeated FacilitatorStat stats = 1;
+    uint64 slot = 2;
+}
+
+message FacilitatorStat {
+    string facilitator_address = 1;
+    uint64 total_settlements = 2;
+    string total_volume_settled = 3;
+    string total_fees_spent = 4;           // Total lamports spent on tx fees
+    google.protobuf.Timestamp first_settlement_at = 5;
+    google.protobuf.Timestamp last_settlement_at = 6;
+}

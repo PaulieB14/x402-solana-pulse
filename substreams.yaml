@@ -1,0 +1,200 @@
+specVersion: v0.1.0
+package:
+  name: x402_solana_pulse
+  version: v1.0.0
+  description: "x402 Solana Pulse - Real-time payment protocol analytics for Coinbase x402 on Solana"
+  url: "https://github.com/PaulieB14/x402-solana-pulse"
+  image: "./x402-icon.jpg"
+
+imports:
+  database_change: https://github.com/streamingfast/substreams-sink-database-changes/releases/download/v2.1.0/substreams-sink-database-changes-v2.1.0.spkg
+  sql: https://github.com/streamingfast/substreams-sink-sql/releases/download/protodefs-v1.0.7/substreams-sink-sql-protodefs-v1.0.7.spkg
+
+protobuf:
+  files:
+    - x402.proto
+  importPaths:
+    - ./proto
+  excludePaths:
+    - sf/substreams
+    - google
+
+binaries:
+  default:
+    type: wasm/rust-v1
+    file: ./target/wasm32-unknown-unknown/release/substreams.wasm
+
+network: solana
+
+params:
+  db_out: "min_amount=0"
+
+modules:
+  # =============================================
+  # LAYER 1: Settlement Extraction
+  # =============================================
+
+  - name: map_x402_settlements
+    kind: map
+    doc: |
+      Extracts x402 payment settlements on Solana by detecting the SVM `exact`
+      scheme settlement shape: a transaction that contains an SPL Token (or
+      Token-2022) TransferChecked instruction paired with an SPL Memo
+      instruction, where the transaction fee payer is distinct from the
+      TransferChecked authority (the facilitator sponsors, the payer signs).
+      Per the x402 SVM exact scheme:
+      https://github.com/coinbase/x402/blob/main/specs/schemes/exact/scheme_exact_svm.md
+    initialBlock: 280000000
+    inputs:
+      - source: sf.solana.type.v1.Block
+    output:
+      type: proto:x402.v1.Settlements
+
+  # =============================================
+  # LAYER 2: State Stores
+  # =============================================
+
+  - name: store_payer_volume
+    kind: store
+    doc: "Accumulates total payment volume per payer. Key: {payer_pubkey}"
+    initialBlock: 280000000
+    updatePolicy: add
+    valueType: bigint
+    inputs:
+      - map: map_x402_settlements
+
+  - name: store_payer_count
+    kind: store
+    doc: "Counts total payments per payer. Key: {payer_pubkey}"
+    initialBlock: 280000000
+    updatePolicy: add
+    valueType: int64
+    inputs:
+      - map: map_x402_settlements
+
+  - name: store_recipient_volume
+    kind: store
+    doc: "Accumulates total revenue per recipient. Key: {recipient_pubkey}"
+    initialBlock: 280000000
+    updatePolicy: add
+    valueType: bigint
+    inputs:
+      - map: map_x402_settlements
+
+  - name: store_recipient_count
+    kind: store
+    doc: "Counts total payments per recipient. Key: {recipient_pubkey}"
+    initialBlock: 280000000
+    updatePolicy: add
+    valueType: int64
+    inputs:
+      - map: map_x402_settlements
+
+  - name: store_facilitator_volume
+    kind: store
+    doc: "Accumulates total volume settled per facilitator. Key: {facilitator_pubkey}"
+    initialBlock: 280000000
+    updatePolicy: add
+    valueType: bigint
+    inputs:
+      - map: map_x402_settlements
+
+  - name: store_facilitator_count
+    kind: store
+    doc: "Counts total settlements per facilitator. Key: {facilitator_pubkey}"
+    initialBlock: 280000000
+    updatePolicy: add
+    valueType: int64
+    inputs:
+      - map: map_x402_settlements
+
+  - name: store_facilitator_fees
+    kind: store
+    doc: "Accumulates total tx fees (lamports) spent per facilitator. Key: {facilitator_pubkey}"
+    initialBlock: 280000000
+    updatePolicy: add
+    valueType: bigint
+    inputs:
+      - map: map_x402_settlements
+
+  - name: store_first_seen
+    kind: store
+    doc: "Records first-seen block timestamp per entity. Key: payer:{p}, recipient:{r}, facilitator:{f}"
+    initialBlock: 280000000
+    updatePolicy: set_if_not_exists
+    valueType: int64
+    inputs:
+      - map: map_x402_settlements
+
+  # =============================================
+  # LAYER 3: Computed Analytics
+  # =============================================
+
+  - name: map_payer_stats
+    kind: map
+    initialBlock: 280000000
+    inputs:
+      - map: map_x402_settlements
+      - store: store_payer_volume
+        mode: deltas
+      - store: store_payer_count
+        mode: get
+      - store: store_first_seen
+        mode: get
+    output:
+      type: proto:x402.v1.PayerStats
+
+  - name: map_recipient_stats
+    kind: map
+    initialBlock: 280000000
+    inputs:
+      - map: map_x402_settlements
+      - store: store_recipient_volume
+        mode: deltas
+      - store: store_recipient_count
+        mode: get
+      - store: store_first_seen
+        mode: get
+    output:
+      type: proto:x402.v1.RecipientStats
+
+  - name: map_facilitator_stats
+    kind: map
+    initialBlock: 280000000
+    inputs:
+      - map: map_x402_settlements
+      - store: store_facilitator_volume
+        mode: deltas
+      - store: store_facilitator_count
+        mode: get
+      - store: store_facilitator_fees
+        mode: get
+      - store: store_first_seen
+        mode: get
+    output:
+      type: proto:x402.v1.FacilitatorStats
+
+  # =============================================
+  # LAYER 4: SQL Sink Output
+  # =============================================
+
+  - name: db_out
+    kind: map
+    initialBlock: 280000000
+    inputs:
+      - params: string
+      - map: map_x402_settlements
+      - map: map_payer_stats
+      - map: map_recipient_stats
+      - map: map_facilitator_stats
+    output:
+      type: proto:sf.substreams.sink.database.v1.DatabaseChanges
+
+sink:
+  module: db_out
+  type: sf.substreams.sink.sql.v1.Service
+  config:
+    schema: "./schema.sql"
+    engine: postgres
+    postgraphile_frontend:
+      enabled: true
