@@ -68,6 +68,14 @@ pub struct Settlement {
     /// Memo instruction data (UTF-8)
     #[prost(string, tag = "15")]
     pub memo: ::prost::alloc::string::String,
+    /// Facilitator enrichment (from x402scan registry)
+    ///
+    /// e.g. "Coinbase", "PayAI" — empty if unknown
+    #[prost(string, tag = "16")]
+    pub facilitator_name: ::prost::alloc::string::String,
+    /// true if fee_payer is in the known-facilitator allowlist
+    #[prost(bool, tag = "17")]
+    pub facilitator_known: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PayerStats {

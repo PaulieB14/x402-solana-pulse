@@ -60,6 +60,48 @@ const CB_SET_LIMIT: u8 = 2;
 /// ComputeBudget SetComputeUnitPrice discriminator
 const CB_SET_PRICE: u8 = 3;
 
+/// Known x402 facilitators on Solana, mirrored from
+/// https://github.com/Merit-Systems/x402scan/tree/main/packages/external/facilitators/src/facilitators
+///
+/// Used for name enrichment and as a relaxed-detection fallback so non-spec
+/// variants from known facilitators still get indexed. New facilitators
+/// that follow the SVM `exact` spec are captured automatically by the
+/// strict layout check — this table only adds name/flag enrichment and
+/// covers implementations that deviate from spec.
+const KNOWN_FACILITATORS: &[(&str, &str)] = &[
+    ("34DmdeSbEnng2bmbSj9ActckY49km2HdhiyAwyXZucqP", "AnySpend"),
+    ("8x8CzkTHTYkW18frrTR7HdCV6fsjenvcykJAXWvoPQW", "Aurracloud"),
+    ("PcTZWki36z5Y82TAATKK48XUdfsgmS5oLkw2Ta7vWyK", "Bitrefill"),
+    ("7NetKx8TuRMBpqYFKZCVetkNuvWCPTrgekmGrsJwTmfN", "Cascade"),
+    ("HsozMJWWHNADoZRmhDGKzua6XW6NNfNDdQ4CkE9i5wHt", "CodeNut"),
+    ("L54zkaPQFeTn1UsEqieEXBqWrPShiaZEPD7mS5WXfQg", "Coinbase"),
+    ("BENrLoUbndxoNMUS5JXApGMtNykLjFXXixMtpDwDR9SP", "Coinbase"),
+    ("BFK9TLC3edb13K6v4YyH3DwPb5DSUpkWvb7XnqCL9b4F", "Coinbase"),
+    ("D6ZhtNQ5nT9ZnTHUbqXZsTx5MH2rPFiBBggX4hY1WePM", "Coinbase"),
+    ("GVJJ7rdGiXr5xaYbRwRbjfaJL7fmwRygFi1H6aGqDveb", "Coinbase"),
+    ("Hc3sdEAsCGQcpgfivywog9uwtk8gUBUZgsxdME1EJy88", "Coinbase"),
+    ("AepWpq3GQwL8CeKMtZyKtKPa7W91Coygh3ropAJapVdU", "Corbits"),
+    ("DuQ4jFMmVABWGxabYHFkGzdyeJgS1hp4wrRuCtsJgT9a", "Daydreams"),
+    ("DEXVS3su4dZQWTvvPnLDJLRK1CeeKG6K3QqdzthgAkNV", "Dexter"),
+    ("Hbe1vdFs4EQVVAzcV12muHhr6DEKwrT9roMXGPLxLBLP", "OpenFacilitator"),
+    ("5xvht4fYDs99yprfm4UeuHSLxMBRpotfBtUCQqM3oDNG", "OpenX402"),
+    ("2wKupLR9q6wXYppw8Gr2NvWxKBUqm4PPJKkQfoxHDBg4", "PayAI"),
+    ("CjNFTjvBhbJJd2B5ePPMHRLx1ELZpa8dwQgGL727eKww", "PayAI"),
+    ("8B5UKhwfAyFW67h58cBkQj1Ur6QXRgwWJJcQp8ZBsDPa", "PayAI"),
+    ("4x4ZhcqiT1FnirM8Ne97iVupkN4NcQgc2YYbE2jDZbZn", "Relai"),
+    ("F742C4VfFLQ9zRQyithoj5229ZgtX2WqKCSFKgH2EThq", "UltravioletaDAO"),
+    ("561oabzy81vXYYbs1ZHR1bvpiEr6Nbfd6PGTxPshoz4p", "X402Jobs"),
+];
+
+fn lookup_facilitator(pubkey: &str) -> (String, bool) {
+    for (addr, name) in KNOWN_FACILITATORS {
+        if *addr == pubkey {
+            return (name.to_string(), true);
+        }
+    }
+    (String::new(), false)
+}
+
 /// Convert Unix timestamp seconds to PostgreSQL TIMESTAMP format
 fn unix_to_timestamp(secs: i64) -> String {
     let days_since_epoch = secs / 86400;
@@ -260,19 +302,23 @@ fn map_x402_settlements(
             continue;
         }
 
-        // Spec: 3 to 6 top-level instructions.
         let top_ixs = &msg.instructions;
-        if top_ixs.len() < 3 || top_ixs.len() > 6 {
+        let keys = resolved_keys(msg, meta);
+        if keys.is_empty() {
             continue;
         }
-
-        let keys = resolved_keys(msg, meta);
         let fee_payer_bytes = &keys[0];
         let fee_payer = b58(fee_payer_bytes);
+        let (facilitator_name, facilitator_known) = lookup_facilitator(&fee_payer);
+
         let signature = b58(&tx.signatures[0]);
         let fee_lamports = meta.fee;
 
-        // Classify each top-level instruction
+        // Two detection paths:
+        //   (a) STRICT — spec-compliant 3-6 instruction layout (any facilitator, known or not)
+        //   (b) RELAXED — known facilitator + TransferChecked + Memo present
+        let strict_ok = top_ixs.len() >= 3 && top_ixs.len() <= 6;
+
         let mut classified: Vec<TopIx> = Vec::with_capacity(top_ixs.len());
         for (i, ix) in top_ixs.iter().enumerate() {
             let prog_idx = ix.program_id_index as usize;
@@ -284,61 +330,64 @@ fn map_x402_settlements(
             classified.push(classify_top_instruction(ix, &program_id, i as u32));
         }
 
-        // Require the exact positional layout
-        if !matches!(classified.first(), Some(TopIx::ComputeBudgetSetLimit)) {
-            continue;
-        }
-        if !matches!(classified.get(1), Some(TopIx::ComputeBudgetSetPrice)) {
-            continue;
-        }
+        // Try strict path first
+        let mut matched: Option<(&TransferCheckedCall, Vec<u8>)> = None;
 
-        // Extract the TransferChecked at index 2
-        let tc = match classified.get(2) {
-            Some(TopIx::TransferChecked(tc)) => tc,
-            _ => continue,
-        };
-
-        // Indices 3..end must be Memo or Lighthouse only, and at least one Memo must exist.
-        let mut memo_data: Option<Vec<u8>> = None;
-        let mut trailing_ok = true;
-        for extra in classified.iter().skip(3) {
-            match extra {
-                TopIx::Memo(data) => {
-                    if memo_data.is_none() {
-                        memo_data = Some(data.clone());
+        if strict_ok {
+            let is_cb_limit = matches!(classified.first(), Some(TopIx::ComputeBudgetSetLimit));
+            let is_cb_price = matches!(classified.get(1), Some(TopIx::ComputeBudgetSetPrice));
+            if is_cb_limit && is_cb_price {
+                if let Some(TopIx::TransferChecked(tc)) = classified.get(2) {
+                    let mut memo_data: Option<Vec<u8>> = None;
+                    let mut trailing_ok = true;
+                    for extra in classified.iter().skip(3) {
+                        match extra {
+                            TopIx::Memo(data) => {
+                                if memo_data.is_none() {
+                                    memo_data = Some(data.clone());
+                                }
+                            }
+                            TopIx::Lighthouse => {}
+                            _ => {
+                                trailing_ok = false;
+                                break;
+                            }
+                        }
                     }
-                }
-                TopIx::Lighthouse => {}
-                _ => {
-                    trailing_ok = false;
-                    break;
+                    if trailing_ok {
+                        if let Some(data) = memo_data {
+                            matched = Some((tc, data));
+                        }
+                    }
                 }
             }
         }
-        if !trailing_ok || memo_data.is_none() {
-            continue;
+
+        // Relaxed path: known facilitator + TransferChecked + Memo anywhere among top-level ixs
+        if matched.is_none() && facilitator_known {
+            let first_tc = classified.iter().find_map(|c| match c {
+                TopIx::TransferChecked(tc) => Some(tc),
+                _ => None,
+            });
+            let first_memo = classified.iter().find_map(|c| match c {
+                TopIx::Memo(d) => Some(d.clone()),
+                _ => None,
+            });
+            if let (Some(tc), Some(memo)) = (first_tc, first_memo) {
+                matched = Some((tc, memo));
+            }
         }
 
-        // Fee-payer safety: fee payer MUST NOT be authority of TransferChecked
+        let Some((tc, memo_bytes)) = matched else {
+            continue;
+        };
+
+        // Facilitator-sponsored check (applies to both paths)
         if (tc.authority_idx as usize) >= keys.len() {
             continue;
         }
         let authority_bytes = &keys[tc.authority_idx as usize];
         if authority_bytes == fee_payer_bytes {
-            continue;
-        }
-
-        // Fee-payer safety: fee payer MUST NOT appear in any instruction's accounts
-        let mut fee_payer_referenced = false;
-        'outer: for ix in top_ixs {
-            for &idx in &ix.accounts {
-                if (idx as usize) < keys.len() && &keys[idx as usize] == fee_payer_bytes {
-                    fee_payer_referenced = true;
-                    break 'outer;
-                }
-            }
-        }
-        if fee_payer_referenced {
             continue;
         }
 
@@ -367,9 +416,7 @@ fn map_x402_settlements(
             .filter(|s| !s.is_empty())
             .unwrap_or(mint_from_instr);
 
-        let memo = memo_data
-            .map(|d| String::from_utf8_lossy(&d).to_string())
-            .unwrap_or_default();
+        let memo = String::from_utf8_lossy(&memo_bytes).to_string();
 
         out.settlements.push(x402::Settlement {
             id: format!("{}-{}", signature, tc.instruction_index),
@@ -387,6 +434,8 @@ fn map_x402_settlements(
             facilitator: fee_payer.clone(),
             fee_lamports: fee_lamports.to_string(),
             memo,
+            facilitator_name: facilitator_name.clone(),
+            facilitator_known,
         });
     }
 
@@ -646,6 +695,8 @@ fn db_out(
             .set("decimals", s.decimals as i64)
             .set("token_program", &s.token_program)
             .set("facilitator", &s.facilitator)
+            .set("facilitator_name", &s.facilitator_name)
+            .set("facilitator_known", s.facilitator_known)
             .set("fee_lamports", &s.fee_lamports)
             .set("memo", &s.memo);
     }

@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS settlements (
 
     -- Facilitator info
     facilitator VARCHAR(64) NOT NULL,         -- Transaction fee payer
+    facilitator_name VARCHAR(64) NOT NULL DEFAULT '',  -- Enriched from x402scan allowlist
+    facilitator_known BOOLEAN NOT NULL DEFAULT false,
     fee_lamports NUMERIC(20, 0) NOT NULL DEFAULT 0,
 
     -- Payment reference (Memo instruction data)
@@ -36,6 +38,9 @@ CREATE TABLE IF NOT EXISTS settlements (
 
     created_at TIMESTAMP DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS idx_settlements_facilitator_name ON settlements(facilitator_name);
+CREATE INDEX IF NOT EXISTS idx_settlements_unknown_facilitators ON settlements(facilitator) WHERE facilitator_known = false;
 
 CREATE INDEX IF NOT EXISTS idx_settlements_slot ON settlements(slot);
 CREATE INDEX IF NOT EXISTS idx_settlements_payer ON settlements(payer);

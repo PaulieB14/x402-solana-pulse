@@ -45,6 +45,10 @@ message Settlement {
 
     // Payment reference
     string memo = 15;                     // Memo instruction data (UTF-8)
+
+    // Facilitator enrichment (from x402scan registry)
+    string facilitator_name = 16;         // e.g. "Coinbase", "PayAI" — empty if unknown
+    bool facilitator_known = 17;          // true if fee_payer is in the known-facilitator allowlist
 }
 
 // =============================================

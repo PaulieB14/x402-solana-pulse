@@ -18,13 +18,28 @@ The [x402 protocol](https://docs.cdp.coinbase.com/x402/core-concepts/how-it-work
 4. Solana executes an SPL Token (or Token-2022) `TransferChecked` + SPL Memo instruction
 5. **This Substreams captures those transactions** by looking for the x402 SVM settlement shape
 
-### Detection heuristic
+### Detection: strict spec match + known-facilitator fallback
 
-Solana has no on-chain `FacilitatorRegistry`. Instead, x402 settlements are identified by three signals observed together in a transaction:
+Solana has no on-chain `FacilitatorRegistry`. This substreams uses a two-layer approach:
 
-- Contains an SPL Token or Token-2022 `TransferChecked` instruction
-- Contains an SPL Memo instruction (payment reference / nonce)
-- Transaction `fee_payer` is distinct from the `TransferChecked` authority — i.e. the facilitator sponsors, the payer signs
+**1. Strict spec match (any facilitator, known or new):** Matches the SVM `exact` scheme layout verbatim — 3–6 top-level instructions consisting of ComputeBudget SetLimit, ComputeBudget SetPrice, TransferChecked, then optional Memo / Lighthouse. Fee payer must differ from the TransferChecked authority. This captures **any** spec-compliant facilitator automatically, including new ones that haven't been added to the allowlist.
+
+**2. Relaxed match for known facilitators:** For the 21 facilitator pubkeys mirrored from [x402scan's registry](https://github.com/Merit-Systems/x402scan/tree/main/packages/external/facilitators/src/facilitators), we accept looser layouts (TransferChecked + Memo anywhere in top-level instructions) so non-spec variants still get indexed. Known facilitators include: Coinbase, PayAI, Dexter, Daydreams, OpenX402, AnySpend, CodeNut, Corbits, Aurracloud, Bitrefill, Cascade, OpenFacilitator, Relai, UltravioletaDAO, X402Jobs.
+
+### Discovering new facilitators
+
+Every settlement has `facilitator_name` (empty if unknown) and `facilitator_known` (boolean). To find new facilitators to add to the allowlist:
+
+```sql
+SELECT facilitator, COUNT(*) AS tx_count, SUM(amount) AS volume
+FROM settlements
+WHERE facilitator_known = false
+GROUP BY facilitator
+ORDER BY tx_count DESC
+LIMIT 20;
+```
+
+High-volume unknown fee-payers are candidates. Verify on Solscan, then add to `KNOWN_FACILITATORS` in [src/lib.rs](src/lib.rs) and publish a new version.
 
 ## Modules
 

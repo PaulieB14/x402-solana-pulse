@@ -1,7 +1,7 @@
 specVersion: v0.1.0
 package:
   name: x402_solana_pulse
-  version: v1.0.0
+  version: v1.1.0
   description: "x402 Solana Pulse - Real-time payment protocol analytics for Coinbase x402 on Solana"
   url: "https://github.com/PaulieB14/x402-solana-pulse"
   image: "./x402-icon.jpg"
