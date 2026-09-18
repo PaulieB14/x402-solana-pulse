@@ -76,6 +76,18 @@ pub struct Settlement {
     /// true if fee_payer is in the known-facilitator allowlist
     #[prost(bool, tag = "17")]
     pub facilitator_known: bool,
+    /// Which x402 scheme produced this settlement: "exact" or "upto".
+    ///
+    /// exact — SPL TransferChecked at top level, authority IS the payer.
+    /// upto  — payment-channels program at top level; the TransferChecked is a CPI
+    ///          and its authority is the CHANNEL PDA, not the end payer. For those
+    ///          rows `payer` carries the channel authority and `channel` repeats it,
+    ///          so a consumer never has to guess which one it is holding.
+    #[prost(string, tag = "18")]
+    pub scheme: ::prost::alloc::string::String,
+    /// Channel authority PDA for `upto` settlements; empty for `exact`.
+    #[prost(string, tag = "19")]
+    pub channel: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PayerStats {

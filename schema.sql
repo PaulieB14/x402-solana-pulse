@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS settlements (
     facilitator VARCHAR(64) NOT NULL,         -- Transaction fee payer
     facilitator_name VARCHAR(64) NOT NULL DEFAULT '',  -- Enriched from x402scan allowlist
     facilitator_known BOOLEAN NOT NULL DEFAULT false,
+    scheme VARCHAR(8) NOT NULL DEFAULT 'exact', -- 'exact' | 'upto'
+    channel VARCHAR(64) NOT NULL DEFAULT '',   -- channel PDA for upto, '' for exact
     fee_lamports NUMERIC(20, 0) NOT NULL DEFAULT 0,
 
     -- Payment reference (Memo instruction data)

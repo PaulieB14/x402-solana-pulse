@@ -55,6 +55,20 @@ const COMPUTE_BUDGET: &str = "ComputeBudget111111111111111111111111111111";
 /// Lighthouse program (wallet-injected guards)
 const LIGHTHOUSE: &str = "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95";
 
+/// x402 SVM `upto` scheme: the payment-channels program.
+///
+/// Unlike `exact`, the token movement here is a CPI *from* this program, so it
+/// never appears among the top-level instructions the exact detector walks. The
+/// observed shape on mainnet is
+/// `[ComputeBudget, ComputeBudget, PAYMENT_CHANNELS, Memo]` with an inner
+/// SPL TransferChecked. Crucially the inner transfer's authority is the channel
+/// PDA, not the end payer, which is why these rows are tagged and the channel is
+/// carried explicitly rather than quietly written into `payer` as if it were one.
+const PAYMENT_CHANNELS: &str = "CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX";
+
+const SCHEME_EXACT: &str = "exact";
+const SCHEME_UPTO: &str = "upto";
+
 /// ComputeBudget SetComputeUnitLimit discriminator
 const CB_SET_LIMIT: u8 = 2;
 /// ComputeBudget SetComputeUnitPrice discriminator
@@ -226,6 +240,7 @@ enum TopIx<'a> {
     ComputeBudgetSetPrice,
     TransferChecked(TransferCheckedCall<'a>),
     Memo(Vec<u8>),
+    PaymentChannels,
     Lighthouse,
     Other,
 }
@@ -253,6 +268,7 @@ fn classify_top_instruction<'a>(
             }
         }
         SPL_MEMO_V1 | SPL_MEMO_V2 => TopIx::Memo(ix.data.clone()),
+        PAYMENT_CHANNELS => TopIx::PaymentChannels,
         LIGHTHOUSE => TopIx::Lighthouse,
         _ => TopIx::Other,
     }
@@ -378,6 +394,101 @@ fn map_x402_settlements(
             }
         }
 
+        // ---- upto scheme: payment-channels ----------------------------------
+        //
+        // Runs before the exact path bails out, because an upto settlement has no
+        // top-level TransferChecked at all — `matched` is always None for one.
+        // Shape confirmed against mainnet: a top-level payment-channels
+        // instruction, a Memo, and the actual SPL TransferChecked as a CPI.
+        if matched.is_none()
+            && classified
+                .iter()
+                .any(|c| matches!(c, TopIx::PaymentChannels))
+        {
+            let memo_bytes = classified
+                .iter()
+                .find_map(|c| match c {
+                    TopIx::Memo(d) => Some(d.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+
+            for group in meta.inner_instructions.iter() {
+                for inner in group.instructions.iter() {
+                    let prog_idx = inner.program_id_index as usize;
+                    if prog_idx >= keys.len() {
+                        continue;
+                    }
+                    let program_id = b58(&keys[prog_idx]);
+                    if program_id != SPL_TOKEN_PROGRAM && program_id != TOKEN_2022_PROGRAM {
+                        continue;
+                    }
+                    let Some(tc) = try_transfer_checked(
+                        &inner.accounts,
+                        &inner.data,
+                        group.index,
+                        program_id_to_static(&program_id),
+                    ) else {
+                        continue;
+                    };
+                    if (tc.authority_idx as usize) >= keys.len()
+                        || (tc.destination_idx as usize) >= keys.len()
+                        || (tc.mint_idx as usize) >= keys.len()
+                    {
+                        continue;
+                    }
+                    // Same sponsorship rule as exact: the facilitator pays the fee,
+                    // it does not move its own tokens.
+                    let authority_bytes = &keys[tc.authority_idx as usize];
+                    if authority_bytes == fee_payer_bytes {
+                        continue;
+                    }
+
+                    let channel = b58(authority_bytes);
+                    let destination_ata = b58(&keys[tc.destination_idx as usize]);
+                    let mint_from_instr = b58(&keys[tc.mint_idx as usize]);
+
+                    let recipient = meta
+                        .post_token_balances
+                        .iter()
+                        .find(|b| b.account_index == tc.destination_idx as u32)
+                        .map(|b| b.owner.clone())
+                        .unwrap_or_default();
+
+                    let mint = meta
+                        .post_token_balances
+                        .iter()
+                        .find(|b| b.account_index == tc.destination_idx as u32)
+                        .map(|b| b.mint.clone())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(mint_from_instr);
+
+                    out.settlements.push(x402::Settlement {
+                        id: format!("{}-upto-{}", signature, tc.instruction_index),
+                        signature: signature.clone(),
+                        instruction_index: tc.instruction_index,
+                        slot,
+                        timestamp: block_timestamp.clone(),
+                        payer: channel.clone(),
+                        recipient,
+                        destination_ata,
+                        mint,
+                        amount: tc.amount.to_string(),
+                        decimals: tc.decimals as u32,
+                        token_program: tc.token_program.to_string(),
+                        facilitator: fee_payer.clone(),
+                        fee_lamports: fee_lamports.to_string(),
+                        memo: String::from_utf8_lossy(&memo_bytes).to_string(),
+                        facilitator_name: facilitator_name.clone(),
+                        facilitator_known,
+                        scheme: SCHEME_UPTO.to_string(),
+                        channel,
+                    });
+                }
+            }
+            continue;
+        }
+
         let Some((tc, memo_bytes)) = matched else {
             continue;
         };
@@ -436,6 +547,8 @@ fn map_x402_settlements(
             memo,
             facilitator_name: facilitator_name.clone(),
             facilitator_known,
+            scheme: SCHEME_EXACT.to_string(),
+            channel: String::new(),
         });
     }
 
@@ -698,7 +811,9 @@ fn db_out(
             .set("facilitator_name", &s.facilitator_name)
             .set("facilitator_known", s.facilitator_known)
             .set("fee_lamports", &s.fee_lamports)
-            .set("memo", &s.memo);
+            .set("memo", &s.memo)
+            .set("scheme", &s.scheme)
+            .set("channel", &s.channel);
     }
 
     for stat in payer_stats.stats {
