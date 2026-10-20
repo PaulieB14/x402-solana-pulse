@@ -26,7 +26,8 @@ use substreams::store::{
     StoreAddBigInt, StoreAddInt64, StoreGet, StoreGetBigInt, StoreGetInt64,
     StoreSetIfNotExistsInt64,
 };
-use substreams_database_change::pb::database::DatabaseChanges;
+use substreams_database_change::pb::sf::substreams::sink::database::v1::DatabaseChanges;
+use buffa_types::google::protobuf::Timestamp;
 use substreams_database_change::tables::Tables;
 use substreams_solana::pb::sf::solana::r#type::v1 as sol;
 
@@ -291,27 +292,27 @@ fn map_x402_settlements(
 ) -> Result<x402::Settlements, substreams::errors::Error> {
     let block_timestamp = blk
         .block_time
-        .as_ref()
-        .map(|t| prost_types::Timestamp {
+        .as_option()
+        .map(|t| Timestamp {
             seconds: t.timestamp,
-            nanos: 0,
+            nanos: 0, ..Default::default()
         });
     let slot = blk.slot;
 
     let mut out = x402::Settlements {
         slot,
-        block_timestamp: block_timestamp.clone(),
+        block_timestamp: block_timestamp.clone().into(),
         ..Default::default()
     };
 
     for confirmed_tx in blk.transactions() {
-        let Some(meta) = confirmed_tx.meta.as_ref() else {
+        let Some(meta) = confirmed_tx.meta.as_option() else {
             continue;
         };
-        let Some(tx) = confirmed_tx.transaction.as_ref() else {
+        let Some(tx) = confirmed_tx.transaction.as_option() else {
             continue;
         };
-        let Some(msg) = tx.message.as_ref() else {
+        let Some(msg) = tx.message.as_option() else {
             continue;
         };
         if tx.signatures.is_empty() || msg.account_keys.is_empty() {
@@ -468,7 +469,7 @@ fn map_x402_settlements(
                         signature: signature.clone(),
                         instruction_index: tc.instruction_index,
                         slot,
-                        timestamp: block_timestamp.clone(),
+                        timestamp: block_timestamp.clone().into(),
                         payer: channel.clone(),
                         recipient,
                         destination_ata,
@@ -534,7 +535,7 @@ fn map_x402_settlements(
             signature: signature.clone(),
             instruction_index: tc.instruction_index,
             slot,
-            timestamp: block_timestamp.clone(),
+            timestamp: block_timestamp.clone().into(),
             payer,
             recipient,
             destination_ata,
@@ -652,7 +653,7 @@ fn store_facilitator_fees(settlements: x402::Settlements, store: StoreAddBigInt)
 fn store_first_seen(settlements: x402::Settlements, store: StoreSetIfNotExistsInt64) {
     let ts = settlements
         .block_timestamp
-        .as_ref()
+        .as_option()
         .map(|t| t.seconds)
         .unwrap_or(0);
     for s in settlements.settlements {
@@ -688,12 +689,12 @@ fn map_payer_stats(
         let total_payments = count_store.get_last(&payer).unwrap_or(0) as u64;
         let first_payment_at = first_seen_store
             .get_last(format!("payer:{}", payer))
-            .map(|secs| prost_types::Timestamp { seconds: secs, nanos: 0 });
+            .map(|secs| Timestamp { seconds: secs, nanos: 0, ..Default::default() });
         stats.stats.push(x402::PayerStat {
             payer_address: payer,
             total_spent: delta.new_value.to_string(),
             total_payments,
-            first_payment_at,
+            first_payment_at: first_payment_at.into(),
             last_payment_at: settlements.block_timestamp.clone(),
         });
     }
@@ -716,12 +717,12 @@ fn map_recipient_stats(
         let total_payments = count_store.get_last(&recipient).unwrap_or(0) as u64;
         let first_payment_at = first_seen_store
             .get_last(format!("recipient:{}", recipient))
-            .map(|secs| prost_types::Timestamp { seconds: secs, nanos: 0 });
+            .map(|secs| Timestamp { seconds: secs, nanos: 0, ..Default::default() });
         stats.stats.push(x402::RecipientStat {
             recipient_address: recipient,
             total_received: delta.new_value.to_string(),
             total_payments,
-            first_payment_at,
+            first_payment_at: first_payment_at.into(),
             last_payment_at: settlements.block_timestamp.clone(),
         });
     }
@@ -749,13 +750,13 @@ fn map_facilitator_stats(
             .unwrap_or_else(|| "0".to_string());
         let first_settlement_at = first_seen_store
             .get_last(format!("facilitator:{}", facilitator))
-            .map(|secs| prost_types::Timestamp { seconds: secs, nanos: 0 });
+            .map(|secs| Timestamp { seconds: secs, nanos: 0, ..Default::default() });
         stats.stats.push(x402::FacilitatorStat {
             facilitator_address: facilitator,
             total_settlements,
             total_volume_settled: delta.new_value.to_string(),
             total_fees_spent: total_fees,
-            first_settlement_at,
+            first_settlement_at: first_settlement_at.into(),
             last_settlement_at: settlements.block_timestamp.clone(),
         });
     }
@@ -790,7 +791,7 @@ fn db_out(
         }
         let timestamp = s
             .timestamp
-            .as_ref()
+            .as_option()
             .map(|t| unix_to_timestamp(t.seconds))
             .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
 
@@ -819,12 +820,12 @@ fn db_out(
     for stat in payer_stats.stats {
         let first_ts = stat
             .first_payment_at
-            .as_ref()
+            .as_option()
             .map(|t| unix_to_timestamp(t.seconds))
             .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
         let last_ts = stat
             .last_payment_at
-            .as_ref()
+            .as_option()
             .map(|t| unix_to_timestamp(t.seconds))
             .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
         tables
@@ -838,12 +839,12 @@ fn db_out(
     for stat in recipient_stats.stats {
         let first_ts = stat
             .first_payment_at
-            .as_ref()
+            .as_option()
             .map(|t| unix_to_timestamp(t.seconds))
             .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
         let last_ts = stat
             .last_payment_at
-            .as_ref()
+            .as_option()
             .map(|t| unix_to_timestamp(t.seconds))
             .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
         tables
@@ -857,12 +858,12 @@ fn db_out(
     for stat in facilitator_stats.stats {
         let first_ts = stat
             .first_settlement_at
-            .as_ref()
+            .as_option()
             .map(|t| unix_to_timestamp(t.seconds))
             .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
         let last_ts = stat
             .last_settlement_at
-            .as_ref()
+            .as_option()
             .map(|t| unix_to_timestamp(t.seconds))
             .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
         tables
